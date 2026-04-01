@@ -1,3 +1,5 @@
 images/
 panoptic_maps/
 dl_env/
+weights/
+motion-deeplab.py
