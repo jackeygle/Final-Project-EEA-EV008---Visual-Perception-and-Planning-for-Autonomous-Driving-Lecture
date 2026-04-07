@@ -1,34 +1,140 @@
 import torch
 import torch.nn.functional as F
 
-def compute_loss(predictions, targets, offset_weights):
-    # Semantic loss (cross entropy)
+
+def compute_loss(
+    predictions,
+    targets,
+    offset_weights,
+    motion_weights,
+    aux_semantic_weight: float = 0.4,
+    center_loss_weight: float = 200.0,
+    offset_loss_weight: float = 0.01,
+    motion_loss_weight: float = 0.01,
+):
     sem_loss = F.cross_entropy(
-        predictions['semantic_logits'],
-        targets['semantic_masks'],
-        ignore_index=255
+        predictions["semantic_logits"],
+        targets["semantic_masks"],
+        ignore_index=255,
     )
 
-    # Instance center heatmap loss (mean squared error)
-    # Weight: 200.0
-    center_loss = F.mse_loss(
-        predictions['center_heatmap'],
-        targets['center_heatmaps']
-    )
+    thing_mask = offset_weights > 0
+    center_sq = (predictions["center_heatmap"] - targets["center_heatmaps"]) ** 2
+    if thing_mask.any():
+        center_loss = (center_sq * thing_mask.float()).sum() / thing_mask.float().sum()
+    else:
+        center_loss = center_sq.mean()
 
-    # Instance regression loss (L1)
-    inst_reg_diff = torch.abs(predictions['center_offsets'] - targets['center_offsets'])
+    inst_reg_diff = torch.abs(predictions["center_offsets"] - targets["center_offsets"])
     inst_reg_loss = torch.mean(inst_reg_diff * offset_weights)
 
-    # Motion Regression Loss (L1)
+    motion_reg_diff = torch.abs(predictions["motion_offsets"] - targets["motion_offsets"])
+    motion_reg_loss = torch.mean(motion_reg_diff * motion_weights)
 
-    motion_reg_diff = torch.abs(predictions['motion_offsets'] - targets['motion_offsets'])
-    motion_reg_loss = torch.mean(motion_reg_diff * offset_weights)
+    total_loss = (
+        sem_loss
+        + (center_loss_weight * center_loss)
+        + (offset_loss_weight * inst_reg_loss)
+        + (motion_loss_weight * motion_reg_loss)
+    )
 
-    total_loss = sem_loss + (200.0 * center_loss) + (0.01 * inst_reg_loss) + (0.01 * motion_reg_loss)
-    return total_loss, sem_loss, center_loss, inst_reg_loss, motion_reg_loss
+    sem_aux_loss = predictions["semantic_logits"].new_tensor(0.0)
+    if aux_semantic_weight > 0 and "semantic_logits_aux" in predictions:
+        aux = predictions["semantic_logits_aux"]
+        h, w = aux.shape[2], aux.shape[3]
+        sem_ds = (
+            F.interpolate(
+                targets["semantic_masks"].unsqueeze(1).float(),
+                size=(h, w),
+                mode="nearest",
+            )
+            .squeeze(1)
+            .long()
+        )
+        sem_aux_loss = F.cross_entropy(aux, sem_ds, ignore_index=255)
+        total_loss = total_loss + aux_semantic_weight * sem_aux_loss
 
-def generate_panoptic_targets(instance_masks, sigma=8.0):
+    return total_loss, sem_loss, center_loss, inst_reg_loss, motion_reg_loss, sem_aux_loss
+
+
+def compute_semantic_pretrain_loss(
+    predictions, semantic_masks, aux_semantic_weight: float = 0.4
+):
+    """Encoder + semantic (+ optional res4 aux) only; for Cityscapes pretrain."""
+    sem_loss = F.cross_entropy(
+        predictions["semantic_logits"],
+        semantic_masks,
+        ignore_index=255,
+    )
+    total_loss = sem_loss
+    sem_aux_loss = predictions["semantic_logits"].new_tensor(0.0)
+    if aux_semantic_weight > 0 and "semantic_logits_aux" in predictions:
+        aux = predictions["semantic_logits_aux"]
+        h, w = aux.shape[2], aux.shape[3]
+        sem_ds = (
+            F.interpolate(
+                semantic_masks.unsqueeze(1).float(),
+                size=(h, w),
+                mode="nearest",
+            )
+            .squeeze(1)
+            .long()
+        )
+        sem_aux_loss = F.cross_entropy(aux, sem_ds, ignore_index=255)
+        total_loss = total_loss + aux_semantic_weight * sem_aux_loss
+    return total_loss, sem_loss, sem_aux_loss
+
+
+def generate_motion_targets(current_inst, prev_inst, sigma=8.0):
+    """Compute motion offsets: for each pixel in current frame, offset to the
+    center of the *same* instance in the previous frame.
+
+    Returns (motion_offsets [B,2,H,W], motion_weights [B,1,H,W],
+             prev_heatmap [B,1,H,W]).
+    """
+    B, H, W = current_inst.shape
+    device = current_inst.device
+
+    motion_offsets = torch.zeros((B, 2, H, W), device=device, dtype=torch.float32)
+    motion_weights = torch.zeros((B, 1, H, W), device=device, dtype=torch.float32)
+    prev_heatmap = torch.zeros((B, 1, H, W), device=device, dtype=torch.float32)
+
+    y_coord, x_coord = torch.meshgrid(
+        torch.arange(H, dtype=torch.float32, device=device),
+        torch.arange(W, dtype=torch.float32, device=device),
+        indexing="ij",
+    )
+
+    for b in range(B):
+        prev_ids = torch.unique(prev_inst[b])
+        for uid in prev_ids:
+            if uid == 0 or uid == 255:
+                continue
+            prev_mask = prev_inst[b] == uid
+            prev_cy = y_coord[prev_mask].mean()
+            prev_cx = x_coord[prev_mask].mean()
+
+            dist_sq = (y_coord - prev_cy) ** 2 + (x_coord - prev_cx) ** 2
+            prev_heatmap[b, 0] = torch.maximum(
+                prev_heatmap[b, 0], torch.exp(-dist_sq / (2 * sigma ** 2))
+            )
+
+            curr_mask = current_inst[b] == uid
+            if not curr_mask.any():
+                continue
+            cur_ys = y_coord[curr_mask]
+            cur_xs = x_coord[curr_mask]
+            motion_offsets[b, 0, curr_mask] = prev_cy - cur_ys
+            motion_offsets[b, 1, curr_mask] = prev_cx - cur_xs
+            motion_weights[b, 0, curr_mask] = 1.0
+
+    return motion_offsets, motion_weights, prev_heatmap
+
+
+def generate_panoptic_targets(
+    instance_masks,
+    sigma=8.0,
+):
     """
     Converts raw instance ID masks into center heatmaps and regression offsets.
     """

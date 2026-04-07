@@ -3,8 +3,19 @@ panoptic_maps/
 dl_env/
 motion-deeplab.py
 
-weights/*
-!weights/motion_deeplab_epoch_11.pth
+# Model weights (large binary files)
+*.pth
 
+# Slurm logs and intermediate outputs
+outputs/slurm-*.out
+outputs/grid_*/
+
+# Python
 __pycache__/
 *.pyc
+
+# Kaggle API credentials
+kaggle*.json
+
+# Videos (large)
+*.mp4

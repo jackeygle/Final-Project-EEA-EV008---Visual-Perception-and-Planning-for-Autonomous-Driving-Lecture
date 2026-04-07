@@ -58,7 +58,8 @@ class MotionDeepLabResNet50(nn.Module):
         return {
             'res2': res2,
             'res3': res3,
-            'res5': res5
+            'res4': res4,
+            'res5': res5,
         }
 
 
@@ -114,13 +115,6 @@ class ASPP(nn.Module):
         ], dim=1)
         return self.project(res)
 
-# Test
-aspp = ASPP(in_channels=2048, out_channels=256)
-dummy_res5 = torch.randn(2, 2048, 12, 39)
-output = aspp(dummy_res5)
-print("ASPP Test")
-print(f"Input shape:  {dummy_res5.shape}")
-print(f"Output shape: {output.shape}")
 
 class PanopticDeepLabSingleDecoder(nn.Module):
     """Decodes features for a single task (Semantic or Instance)."""
@@ -244,8 +238,17 @@ class MotionDeepLabDecoder(nn.Module):
             intermediate_channels=32, 
             output_channels=2
         )
+
+        # Deep supervision on res4 (1/16 scale) — same spirit as Panoptic-DeepLab aux loss
+        self.semantic_aux_head = nn.Sequential(
+            ConvBNReLU(1024, 256, kernel_size=3, padding=1),
+            nn.Conv2d(256, 19, kernel_size=1),
+        )
+
     def forward(self, features):
         results = {}
+
+        results["semantic_logits_aux"] = self.semantic_aux_head(features["res4"])
 
         semantic_features = self.semantic_decoder(features)
         results['semantic_logits'] = self.semantic_head(semantic_features)
@@ -269,6 +272,8 @@ class MotionDeepLab(nn.Module):
         results = self.decoder(features)
 
         h_in, w_in = x.shape[2:]
+        aux_logits = results.pop("semantic_logits_aux", None)
+
         for key in results.keys():
             results[key] = F.interpolate(
                 results[key], size=(h_in, w_in), mode='bilinear', align_corners=False
@@ -279,4 +284,7 @@ class MotionDeepLab(nn.Module):
                 scale_x = w_in / (w_in // 4)
                 results[key][:, 0, :, :] *= scale_y
                 results[key][:, 1, :, :] *= scale_x
+
+        if aux_logits is not None:
+            results["semantic_logits_aux"] = aux_logits
         return results

@@ -1,14 +1,21 @@
 # dataset.py
 import os
-import torch
+import random
+
 import numpy as np
+import torch
 import torchvision
 import torchvision.transforms.functional as TF
 from PIL import Image
 from torch.utils.data import Dataset
 
 class KittiStepDataset(Dataset):
-    def __init__(self, root_dir, split='train', image_size=(385, 1249)):
+    def __init__(
+        self,
+        root_dir,
+        split="train",
+        image_size=(385, 1249),
+    ):
         """
         Args:
             root_dir: Path to KITTI_STEP_ROOT
@@ -18,7 +25,6 @@ class KittiStepDataset(Dataset):
         self.root_dir = root_dir
         self.split = split
         self.image_size = image_size
-
         self.img_dir = os.path.join(root_dir, 'images', split)
         self.panoptic_dir = os.path.join(root_dir, 'panoptic_maps', split)
 
@@ -58,18 +64,26 @@ class KittiStepDataset(Dataset):
         curr_img = Image.open(curr_img_path).convert('RGB')
         prev_img = Image.open(prev_img_path).convert('RGB')
         
-        fixed_size = (384, 1248)
-
-        # Resize inputs
-        curr_img = TF.resize(curr_img, fixed_size)
-        prev_img = TF.resize(prev_img, fixed_size)
-
+        crop_h, crop_w = self.image_size
         curr_panoptic_map = Image.open(curr_panoptic_path)
-        curr_panoptic_map = TF.resize(curr_panoptic_map, fixed_size, interpolation=TF.InterpolationMode.NEAREST)
-
         prev_panoptic_map = Image.open(prev_panoptic_path)
-        prev_panoptic_map = TF.resize(prev_panoptic_map, fixed_size, interpolation=TF.InterpolationMode.NEAREST)
+
+        fixed_size = (crop_h, crop_w)
+        curr_img = TF.resize(curr_img, fixed_size, interpolation=TF.InterpolationMode.BILINEAR)
+        prev_img = TF.resize(prev_img, fixed_size, interpolation=TF.InterpolationMode.BILINEAR)
+        curr_panoptic_map = TF.resize(
+            curr_panoptic_map, fixed_size, interpolation=TF.InterpolationMode.NEAREST
+        )
+        prev_panoptic_map = TF.resize(
+            prev_panoptic_map, fixed_size, interpolation=TF.InterpolationMode.NEAREST
+        )
         
+        if self.split == "train" and random.random() < 0.5:
+            curr_img = TF.hflip(curr_img)
+            prev_img = TF.hflip(prev_img)
+            curr_panoptic_map = TF.hflip(curr_panoptic_map)
+            prev_panoptic_map = TF.hflip(prev_panoptic_map)
+
         curr_tensor = self.normalize(TF.to_tensor(curr_img))
         prev_tensor = self.normalize(TF.to_tensor(prev_img))
         stacked_images = torch.cat([curr_tensor, prev_tensor], dim=0)
@@ -87,3 +101,4 @@ class KittiStepDataset(Dataset):
         prev_instance_tensor = torch.from_numpy(prev_instance_map).long()
 
         return stacked_images, semantic_tensor, instance_tensor, prev_instance_tensor
+
