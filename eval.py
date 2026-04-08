@@ -23,6 +23,9 @@ from torch.amp import autocast
 
 from dataset import KittiStepDataset
 from model import MotionDeepLab
+from official_postprocess import decode_panoptic_official
+
+THING_CLASSES_KITTI_STEP = [11, 13]
 
 CITYSCAPES_COLORS = [
     [128, 64, 128], [244, 35, 232], [70, 70, 70], [102, 102, 156],
@@ -119,8 +122,8 @@ def main():
     video_writer = None
     saved_result_png = False
 
-    video_path = os.path.join(args.output_dir, "evaluation_video.mp4")
-    result_path = os.path.join(args.output_dir, "evaluation_result.png")
+    video_path = os.path.join(args.output_dir, f"evaluation_video_{args.sequence}.mp4")
+    result_path = os.path.join(args.output_dir, f"evaluation_result_{args.sequence}.png")
 
     with torch.no_grad():
         for i in range(start_idx, end_idx):
@@ -131,7 +134,19 @@ def main():
             with autocast(device_type=device.type, enabled=device.type == "cuda"):
                 predictions = model(model_input)
 
-            prev_heatmap = torch.sigmoid(predictions["center_heatmap"]).detach()
+            _, rendered_hw, _ = decode_panoptic_official(
+                predictions["semantic_logits"][0],
+                predictions["center_heatmap"][0],
+                predictions["center_offsets"][0],
+                thing_class_ids=THING_CLASSES_KITTI_STEP,
+                label_divisor=1000,
+                void_label=255,
+                center_threshold=0.1,
+                nms_kernel=13,
+                keep_k_centers=200,
+                stuff_area_limit=0,
+            )
+            prev_heatmap = torch.from_numpy(rendered_hw).unsqueeze(0).unsqueeze(0).to(device)
 
             curr_rgb = torch.clamp(images[0, :3] * std + mean, 0, 1)
             fig = _visualize(curr_rgb, predictions)

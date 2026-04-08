@@ -1,5 +1,7 @@
 """Panoptic + Motion-DeepLab style post-processing (aligned with DeepLab2).
 
+GPU-accelerated version: heavy pixel-level ops run on CUDA when available.
+
 References (Apache-2.0):
 - deeplab2/model/post_processor/panoptic_deeplab.py
 - deeplab2/model/post_processor/motion_deeplab.py
@@ -16,122 +18,159 @@ import torch.nn.functional as F
 
 
 def _centers_from_heatmap_nms(
-    heatmap_hw: np.ndarray,
+    heatmap_logits: torch.Tensor,
     center_threshold: float,
     nms_kernel: int,
     keep_k_centers: int,
-) -> Tuple[np.ndarray, np.ndarray]:
-    """Threshold + NMS on center heatmap; returns centers (N,2) as (y,x)."""
-    h, w = heatmap_hw.shape
-    heat = np.where(heatmap_hw > center_threshold, heatmap_hw, 0.0).astype(np.float32)
-    t = torch.from_numpy(heat).view(1, 1, h, w)
+) -> torch.Tensor:
+    """Threshold + NMS on GPU; returns (N, 2) int tensor of (y, x) centers."""
+    heat = torch.sigmoid(heatmap_logits[0])
+    heat = torch.where(heat > center_threshold, heat, torch.zeros_like(heat))
     pad = nms_kernel // 2
-    pooled = F.max_pool2d(t, kernel_size=nms_kernel, stride=1, padding=pad)
-    pooled = pooled.numpy()[0, 0]
-    heat = np.where((pooled == heat) & (heat > 0), heat, 0.0)
-    ys, xs = np.where(heat > 0.0)
-    if ys.size == 0:
-        return np.zeros((0, 2), dtype=np.int32), heat
+    pooled = F.max_pool2d(heat.unsqueeze(0).unsqueeze(0),
+                          kernel_size=nms_kernel, stride=1, padding=pad)[0, 0]
+    keep = (pooled == heat) & (heat > 0)
+    ys, xs = torch.where(keep)
+    if ys.numel() == 0:
+        return torch.zeros((0, 2), dtype=torch.long, device=heat.device), heat
 
-    centers = np.stack([ys, xs], axis=1).astype(np.int32)
-    if keep_k_centers > 0 and centers.shape[0] > keep_k_centers:
+    if keep_k_centers > 0 and ys.numel() > keep_k_centers:
         scores = heat[ys, xs]
-        order = np.argsort(-scores)
-        order = order[:keep_k_centers]
-        centers = centers[order]
-        keep = np.zeros_like(heat, dtype=np.float32)
-        keep[centers[:, 0], centers[:, 1]] = heat[centers[:, 0], centers[:, 1]]
-        heat = keep
+        topk_idx = torch.topk(scores, k=keep_k_centers).indices
+        ys, xs = ys[topk_idx], xs[topk_idx]
+        mask = torch.zeros_like(heat)
+        mask[ys, xs] = heat[ys, xs]
+        heat = mask
+
+    centers = torch.stack([ys, xs], dim=1)
     return centers, heat
 
 
-def _closest_center_per_pixel(
-    centers_yx: np.ndarray,
-    center_offsets_yx: np.ndarray,
-) -> np.ndarray:
-    """Argmin over centers of || (y,x)+offset - center_k || (official panoptic_deeplab)."""
+def _closest_center_per_pixel_gpu(
+    centers_yx: torch.Tensor,
+    center_offsets_yx: torch.Tensor,
+) -> torch.Tensor:
+    """GPU argmin: assign each pixel to closest center via offsets. Returns (H,W) int."""
     h, w = center_offsets_yx.shape[1], center_offsets_yx.shape[2]
-    if centers_yx.shape[0] == 0:
-        return np.zeros((h, w), dtype=np.int32)
+    n = centers_yx.shape[0]
+    if n == 0:
+        return torch.zeros((h, w), dtype=torch.long, device=centers_yx.device)
 
-    yy, xx = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
-    cy = yy.astype(np.float32) + center_offsets_yx[0]
-    cx = xx.astype(np.float32) + center_offsets_yx[1]
-    flat = np.stack([cy.ravel(), cx.ravel()], axis=-1)
+    yy = torch.arange(h, dtype=torch.float32, device=centers_yx.device).view(-1, 1).expand(h, w)
+    xx = torch.arange(w, dtype=torch.float32, device=centers_yx.device).view(1, -1).expand(h, w)
+    cy = yy + center_offsets_yx[0]
+    cx = xx + center_offsets_yx[1]
 
-    cc = centers_yx.astype(np.float32)
-    d2 = np.sum((flat[:, None, :] - cc[None, :, :]) ** 2, axis=-1)
-    idx = np.argmin(d2, axis=1).reshape(h, w).astype(np.int32)
+    coords = torch.stack([cy, cx], dim=-1)
+    cc = centers_yx.float()
+    d2 = torch.sum((coords.unsqueeze(2) - cc.view(1, 1, n, 2)) ** 2, dim=-1)
+    idx = torch.argmin(d2, dim=2)
     return idx
 
 
-def merge_semantic_instance_panoptic(
-    semantic: np.ndarray,
-    instance_map: np.ndarray,
+def merge_semantic_instance_panoptic_gpu(
+    semantic: torch.Tensor,
+    instance_map: torch.Tensor,
     thing_class_ids: List[int],
     label_divisor: int,
     void_label: int,
     stuff_area_limit: int,
-) -> np.ndarray:
-    """Merge semantic + class-agnostic instance ids into panoptic IDs (numpy)."""
+) -> torch.Tensor:
+    """GPU merge semantic + instance → panoptic IDs."""
     h, w = semantic.shape
-    pan = np.ones((h, w), dtype=np.int32) * (void_label * label_divisor)
-    thing_set = set(thing_class_ids)
-    semantic_thing = np.zeros((h, w), dtype=bool)
-    for c in thing_class_ids:
-        semantic_thing |= semantic == c
+    pan = torch.full((h, w), void_label * label_divisor, dtype=torch.long, device=semantic.device)
 
+    thing_mask = torch.zeros((h, w), dtype=torch.bool, device=semantic.device)
+    for c in thing_class_ids:
+        thing_mask |= semantic == c
+
+    thing_set = set(thing_class_ids)
     num_instance_per_sem = {c: 0 for c in thing_class_ids}
 
-    inst_ids = np.unique(instance_map)
+    inst_ids = torch.unique(instance_map)
     for iid in inst_ids:
         if iid == 0:
             continue
-        thing_mask = np.logical_and(instance_map == iid, semantic_thing)
-        if not np.any(thing_mask):
+        imask = (instance_map == iid) & thing_mask
+        if not imask.any():
             continue
-        vals = semantic[thing_mask]
-        sem_major = int(np.bincount(vals).argmax())
+        vals = semantic[imask]
+        sem_major = int(torch.bincount(vals.long()).argmax())
         if sem_major not in thing_set:
             continue
         num_instance_per_sem[sem_major] += 1
         new_iid = num_instance_per_sem[sem_major]
-        pan = np.where(thing_mask, sem_major * label_divisor + new_iid, pan)
+        pan[imask] = sem_major * label_divisor + new_iid
 
-    inst_stuff = instance_map == 0
-    for sem_id in np.unique(semantic):
+    no_inst = instance_map == 0
+    for sem_id in torch.unique(semantic):
+        sem_id = int(sem_id)
         if sem_id in thing_set:
             continue
-        sm = np.logical_and(semantic == sem_id, inst_stuff)
-        area = int(np.count_nonzero(sm))
+        sm = (semantic == sem_id) & no_inst
+        area = int(sm.sum())
         if stuff_area_limit > 0 and area < stuff_area_limit:
             continue
         if area > 0:
-            pan = np.where(sm, sem_id * label_divisor, pan)
+            pan[sm] = sem_id * label_divisor
 
     return pan
 
 
-def extract_centers_from_panoptic(
-    panoptic_map: np.ndarray,
+def render_panoptic_gaussian_heatmap_gpu(
+    panoptic_map: torch.Tensor,
+    sigma: int,
+    label_divisor: int,
+    void_label: int,
+) -> torch.Tensor:
+    """GPU Gaussian heatmap — local window per instance center."""
+    device = panoptic_map.device
+    h, w = panoptic_map.shape
+    out = torch.zeros((h, w), dtype=torch.float32, device=device)
+    radius = int(3.0 * sigma)
+
+    for pan_id in torch.unique(panoptic_map):
+        pan_id = int(pan_id)
+        sem_id = pan_id // label_divisor
+        if sem_id == void_label or (pan_id % label_divisor) == 0:
+            continue
+        ys, xs = torch.where(panoptic_map == pan_id)
+        if ys.numel() == 0:
+            continue
+        cy = float(ys.float().mean().round())
+        cx = float(xs.float().mean().round())
+        y0 = max(int(cy) - radius, 0)
+        y1 = min(int(cy) + radius + 1, h)
+        x0 = max(int(cx) - radius, 0)
+        x1 = min(int(cx) + radius + 1, w)
+        yy = torch.arange(y0, y1, dtype=torch.float32, device=device).view(-1, 1)
+        xx = torch.arange(x0, x1, dtype=torch.float32, device=device).view(1, -1)
+        g = torch.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2.0 * sigma ** 2))
+        torch.maximum(out[y0:y1, x0:x1], g, out=out[y0:y1, x0:x1])
+    return out
+
+
+def extract_centers_from_panoptic_gpu(
+    panoptic_map: torch.Tensor,
     label_divisor: int,
     void_label: int,
 ) -> np.ndarray:
-    """Rows [x, y, panoptic_id, mask_radius, 0] — same info as render_panoptic_map_as_heatmap."""
+    """Extract [x, y, panoptic_id, mask_radius, 0] rows. Returns numpy on CPU."""
     rows = []
-    for pid in np.unique(panoptic_map):
-        sem_id = int(pid // label_divisor)
-        if sem_id == void_label or int(pid % label_divisor) == 0:
+    for pid in torch.unique(panoptic_map):
+        pid = int(pid)
+        sem_id = pid // label_divisor
+        if sem_id == void_label or (pid % label_divisor) == 0:
             continue
-        ys, xs = np.where(panoptic_map == pid)
-        if ys.size == 0:
+        ys, xs = torch.where(panoptic_map == pid)
+        if ys.numel() == 0:
             continue
         dy = int(ys.max() - ys.min() + 1)
         dx = int(xs.max() - xs.min() + 1)
-        mask_radius = int(round(dy * dx))
-        cx = int(np.round(xs.mean()))
-        cy = int(np.round(ys.mean()))
-        rows.append([cx, cy, int(pid), mask_radius, 0])
+        mask_radius = dy * dx
+        cx = int(xs.float().mean().round())
+        cy = int(ys.float().mean().round())
+        rows.append([cx, cy, pid, mask_radius, 0])
     if not rows:
         return np.zeros((0, 5), dtype=np.int32)
     return np.array(rows, dtype=np.int32)
@@ -150,71 +189,46 @@ def decode_panoptic_official(
     stuff_area_limit: int = 0,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     """
-    Returns:
-      panoptic_map [H,W] (decoder merge, before track),
-      rendered_heatmap [H,W] for next-frame 7th channel (gaussian),
-      current_centers [Nc,5] [x,y,panoptic_id,radius,0] for assign_instances_to_previous_tracks.
-    """
-    sem = torch.argmax(semantic_logits, dim=0).cpu().numpy().astype(np.int32)
-    heat_raw = torch.sigmoid(center_heatmap_logits[0]).cpu().numpy().astype(np.float32)
-    off = center_offsets_yx.cpu().numpy().astype(np.float32)
+    GPU-accelerated panoptic decoding.
 
-    thing_mask = np.zeros_like(sem, dtype=bool)
+    Returns (all numpy on CPU):
+      panoptic_map [H,W],
+      rendered_heatmap [H,W] for next-frame 7th channel,
+      current_centers [Nc,5].
+    """
+    device = semantic_logits.device
+    sem = torch.argmax(semantic_logits, dim=0)
+
+    thing_mask = torch.zeros_like(sem, dtype=torch.bool)
     for c in thing_class_ids:
         thing_mask |= sem == c
 
     centers_yx, _heat_nms = _centers_from_heatmap_nms(
-        heat_raw, center_threshold, nms_kernel, keep_k_centers
+        center_heatmap_logits, center_threshold, nms_kernel, keep_k_centers
     )
+
     if centers_yx.shape[0] == 0:
-        pan = merge_semantic_instance_panoptic(
+        pan = merge_semantic_instance_panoptic_gpu(
             sem,
-            np.zeros_like(sem, dtype=np.int32),
-            thing_class_ids,
-            label_divisor,
-            void_label,
-            stuff_area_limit,
+            torch.zeros_like(sem, dtype=torch.long),
+            thing_class_ids, label_divisor, void_label, stuff_area_limit,
         )
-        rendered = render_panoptic_gaussian_heatmap(
+        rendered = render_panoptic_gaussian_heatmap_gpu(
             pan, sigma=8, label_divisor=label_divisor, void_label=void_label
         )
-        return pan, rendered, np.zeros((0, 5), dtype=np.int32)
+        return pan.cpu().numpy(), rendered.cpu().numpy(), np.zeros((0, 5), dtype=np.int32)
 
-    inst_idx = _closest_center_per_pixel(centers_yx, off)
-    instance_map = np.where(thing_mask, (inst_idx + 1).astype(np.int32), 0)
+    inst_idx = _closest_center_per_pixel_gpu(centers_yx, center_offsets_yx)
+    instance_map = torch.where(thing_mask, (inst_idx + 1).long(), torch.zeros_like(inst_idx))
 
-    pan = merge_semantic_instance_panoptic(
+    pan = merge_semantic_instance_panoptic_gpu(
         sem, instance_map, thing_class_ids, label_divisor, void_label, stuff_area_limit
     )
-    rendered = render_panoptic_gaussian_heatmap(
+    rendered = render_panoptic_gaussian_heatmap_gpu(
         pan, sigma=8, label_divisor=label_divisor, void_label=void_label
     )
-    centers_np = extract_centers_from_panoptic(pan, label_divisor, void_label)
-    return pan, rendered, centers_np
-
-
-def render_panoptic_gaussian_heatmap(
-    panoptic_map: np.ndarray,
-    sigma: int,
-    label_divisor: int,
-    void_label: int,
-) -> np.ndarray:
-    """Gaussian heatmap per instance center (approximation of TF render_panoptic_map_as_heatmap)."""
-    h, w = panoptic_map.shape
-    out = np.zeros((h, w), dtype=np.float32)
-    yy, xx = np.mgrid[0:h, 0:w].astype(np.float32)
-    for pan_id in np.unique(panoptic_map):
-        sem_id = int(pan_id // label_divisor)
-        if sem_id == void_label or int(pan_id % label_divisor) == 0:
-            continue
-        ys, xs = np.where(panoptic_map == pan_id)
-        if ys.size == 0:
-            continue
-        cy = float(np.round(ys.mean()))
-        cx = float(np.round(xs.mean()))
-        g = np.exp(-((yy - cy) ** 2 + (xx - cx) ** 2) / (2.0 * sigma**2)).astype(np.float32)
-        out = np.maximum(out, g)
-    return out
+    centers_np = extract_centers_from_panoptic_gpu(pan, label_divisor, void_label)
+    return pan.cpu().numpy(), rendered.cpu().numpy(), centers_np
 
 
 def assign_instances_to_previous_tracks_numpy(

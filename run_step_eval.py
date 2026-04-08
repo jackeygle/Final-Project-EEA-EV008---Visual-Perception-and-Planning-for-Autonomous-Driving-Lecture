@@ -60,41 +60,48 @@ def _decode_panoptic_legacy(
     center_threshold: float,
     max_centers: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    sem = torch.argmax(semantic_logits, dim=0).cpu().numpy().astype(np.int32)
-    heat = torch.sigmoid(center_heatmap_logits[0]).cpu().numpy().astype(np.float32)
-    offsets = center_offsets.cpu().numpy().astype(np.float32)
+    """GPU-accelerated legacy panoptic decode."""
+    device = semantic_logits.device
+    sem = torch.argmax(semantic_logits, dim=0)
+    heat = torch.sigmoid(center_heatmap_logits[0])
 
     h, w = sem.shape
-    inst = np.zeros((h, w), dtype=np.int32)
-    centers = _extract_centers(heat, threshold=center_threshold, k=max_centers)
-    if centers.shape[0] == 0:
-        return sem * label_divisor, heat
+    inst = torch.zeros((h, w), dtype=torch.long, device=device)
 
-    yy, xx = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
-    pred_cy = yy + offsets[0]
-    pred_cx = xx + offsets[1]
+    heat_np = heat.cpu().numpy().astype(np.float32)
+    centers = _extract_centers(heat_np, threshold=center_threshold, k=max_centers)
+    if centers.shape[0] == 0:
+        return (sem * label_divisor).cpu().numpy().astype(np.int32), heat_np
+
+    sem_np = sem.cpu().numpy()
+    centers_t = torch.from_numpy(centers).to(device)
+
+    yy = torch.arange(h, dtype=torch.float32, device=device).view(-1, 1).expand(h, w)
+    xx = torch.arange(w, dtype=torch.float32, device=device).view(1, -1).expand(h, w)
+    pred_cy = yy + center_offsets[0]
+    pred_cx = xx + center_offsets[1]
 
     for cls in thing_classes:
         cls_mask = sem == cls
-        if not np.any(cls_mask):
+        if not cls_mask.any():
             continue
 
-        cls_centers = centers[sem[centers[:, 0], centers[:, 1]] == cls]
+        cls_center_mask = sem_np[centers[:, 0], centers[:, 1]] == cls
+        cls_centers = centers_t[cls_center_mask]
         if cls_centers.shape[0] == 0:
             continue
 
-        py = pred_cy[cls_mask][:, None]
-        px = pred_cx[cls_mask][:, None]
-        cy = cls_centers[:, 0][None, :].astype(np.float32)
-        cx = cls_centers[:, 1][None, :].astype(np.float32)
-        d2 = (py - cy) ** 2 + (px - cx) ** 2
-        nearest = np.argmin(d2, axis=1) + 1
+        cy_flat = pred_cy[cls_mask]
+        cx_flat = pred_cx[cls_mask]
+        cc_y = cls_centers[:, 0].float()
+        cc_x = cls_centers[:, 1].float()
+        d2 = (cy_flat.unsqueeze(1) - cc_y.unsqueeze(0)) ** 2 + \
+             (cx_flat.unsqueeze(1) - cc_x.unsqueeze(0)) ** 2
+        nearest = torch.argmin(d2, dim=1) + 1
+        inst[cls_mask] = nearest
 
-        ys, xs = np.where(cls_mask)
-        inst[ys, xs] = nearest
-
-    panoptic = sem * label_divisor + inst
-    return panoptic.astype(np.int32), heat
+    panoptic = (sem * label_divisor + inst).cpu().numpy().astype(np.int32)
+    return panoptic, heat_np
 
 
 THING_CLASSES_KITTI_STEP = [11, 13]

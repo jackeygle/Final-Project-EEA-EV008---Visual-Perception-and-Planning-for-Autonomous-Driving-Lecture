@@ -9,11 +9,26 @@ from scipy.optimize import linear_sum_assignment
 
 
 def _mask_iou(mask_a: np.ndarray, mask_b: np.ndarray) -> float:
-    inter = np.count_nonzero(np.logical_and(mask_a, mask_b))
+    inter = np.count_nonzero(mask_a & mask_b)
     if inter == 0:
         return 0.0
     union = np.count_nonzero(mask_a) + np.count_nonzero(mask_b) - inter
     return float(inter / max(union, 1))
+
+
+def _batch_mask_iou(inst_masks: list, track_masks: list) -> np.ndarray:
+    """Compute IoU matrix between all instance masks and track masks efficiently."""
+    n_i, n_t = len(inst_masks), len(track_masks)
+    if n_i == 0 or n_t == 0:
+        return np.zeros((n_i, n_t), dtype=np.float32)
+    h, w = inst_masks[0].shape
+    inst_flat = np.stack([m.ravel() for m in inst_masks], axis=0).astype(np.float32)
+    track_flat = np.stack([m.ravel() for m in track_masks], axis=0).astype(np.float32)
+    inter = inst_flat @ track_flat.T
+    inst_area = inst_flat.sum(axis=1, keepdims=True)
+    track_area = track_flat.sum(axis=1, keepdims=True)
+    union = inst_area + track_area.T - inter
+    return np.where(union > 0, inter / union, 0.0).astype(np.float32)
 
 
 class IoUTracker:
@@ -117,15 +132,14 @@ class IoUTracker:
                 continue
 
             n_i, n_t = len(inst_masks), len(track_ids)
-            cost_matrix = np.full((n_i, n_t), 1e6, dtype=np.float32)
-            iou_matrix = np.zeros((n_i, n_t), dtype=np.float32)
-            for i, im in enumerate(inst_masks):
-                for j, tid in enumerate(track_ids):
-                    iou = _mask_iou(im, self.last_mask_per_track[cls][tid])
-                    iou_matrix[i, j] = iou
+            track_masks_list = [self.last_mask_per_track[cls][tid] for tid in track_ids]
+            iou_matrix = _batch_mask_iou(inst_masks, track_masks_list)
 
-                    cy, cx = inst_centers[i]
-                    py, px = inst_prev_centers[i]
+            cost_matrix = np.full((n_i, n_t), 1e6, dtype=np.float32)
+            for i in range(n_i):
+                cy, cx = inst_centers[i]
+                py, px = inst_prev_centers[i]
+                for j, tid in enumerate(track_ids):
                     ty, tx = self.last_center_per_track[cls][tid]
                     area = max(inst_areas[i], self.last_area_per_track[cls][tid], 1.0)
                     radius = np.sqrt(area)
@@ -138,7 +152,7 @@ class IoUTracker:
                         continue
 
                     dist_term = min(center_dist / (self.center_gate_scale * radius + 1e-6), 1.0)
-                    cost_matrix[i, j] = (1.0 - self.iou_weight) * dist_term + self.iou_weight * (1.0 - iou)
+                    cost_matrix[i, j] = (1.0 - self.iou_weight) * dist_term + self.iou_weight * (1.0 - iou_matrix[i, j])
 
             row_idx, col_idx = linear_sum_assignment(cost_matrix)
             matched_inst = set()
