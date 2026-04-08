@@ -1,4 +1,4 @@
-# dataset_cityscapes.py — Cityscapes fine semantic segmentation for encoder/decoder pretrain
+# dataset_cityscapes.py — Cityscapes for full-branch pretrain (semantic + instance)
 import os
 from pathlib import Path
 
@@ -11,22 +11,24 @@ from torch.utils.data import Dataset
 
 from cityscapes_labels import labelids_to_trainids
 
+# Cityscapes thing trainIds (person=11, rider=12, car=13, truck=14,
+# bus=15, train=16, motorcycle=17, bicycle=18)
+_CITYSCAPES_THING_TRAINIDS = {11, 12, 13, 14, 15, 16, 17, 18}
+
 
 class CityscapesSemSegDataset(Dataset):
-    """
-    Reads official Cityscapes layout:
-      {root}/leftImg8bit/{split}/<city>/*_leftImg8bit.png
-      {root}/gtFine/{split}/<city>/*_gtFine_labelTrainIds.png  (preferred)
-      or *_gtFine_labelIds.png (converted via cityscapes_labels).
+    """Cityscapes dataset supporting both semantic-only and panoptic modes.
 
-    Returns the same image tensor layout as KITTI: 6ch (curr||prev RGB), prev=curr;
-    KITTI training adds a 7th channel (prev heatmap) in the training loop.
+    When panoptic=True (default), also returns instance maps derived from
+    *_gtFine_instanceIds.png, enabling full-branch pretrain (semantic + center + offset).
     """
 
-    def __init__(self, root_dir: str, split: str = "train", image_size=(384, 1248)):
+    def __init__(self, root_dir: str, split: str = "train",
+                 image_size=(384, 1248), panoptic: bool = True):
         self.root_dir = os.path.abspath(root_dir)
         self.split = split
         self.image_size = image_size
+        self.panoptic = panoptic
         self.normalize = torchvision.transforms.Normalize(
             mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
         )
@@ -44,10 +46,14 @@ class CityscapesSemSegDataset(Dataset):
             prefix = img_path.name.replace("_leftImg8bit.png", "")
             train_path = gt_root / city / f"{prefix}_gtFine_labelTrainIds.png"
             ids_path = gt_root / city / f"{prefix}_gtFine_labelIds.png"
-            if train_path.is_file():
-                self.samples.append((str(img_path), str(train_path), "trainid"))
-            elif ids_path.is_file():
-                self.samples.append((str(img_path), str(ids_path), "labelid"))
+            inst_path = gt_root / city / f"{prefix}_gtFine_instanceIds.png"
+            sem_path = str(train_path) if train_path.is_file() else str(ids_path) if ids_path.is_file() else None
+            if sem_path is None:
+                continue
+            lbl_kind = "trainid" if train_path.is_file() else "labelid"
+            entry = (str(img_path), sem_path, lbl_kind,
+                     str(inst_path) if inst_path.is_file() else None)
+            self.samples.append(entry)
 
         if not self.samples:
             raise RuntimeError(
@@ -59,7 +65,7 @@ class CityscapesSemSegDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        img_path, lbl_path, lbl_kind = self.samples[idx]
+        img_path, lbl_path, lbl_kind, inst_path = self.samples[idx]
         h, w = self.image_size
 
         img = Image.open(img_path).convert("RGB")
@@ -75,6 +81,34 @@ class CityscapesSemSegDataset(Dataset):
         else:
             lbl = lbl.astype(np.int64)
             lbl[lbl == 255] = 255
-
         sem = torch.from_numpy(lbl).long()
-        return stacked, sem
+
+        if not self.panoptic or inst_path is None:
+            return stacked, sem
+
+        # Cityscapes instanceIds encode: labelId * 1000 + instanceNum
+        inst_pil = Image.open(inst_path)
+        inst_pil = inst_pil.resize((w, h), Image.NEAREST)
+        inst_raw = np.array(inst_pil, dtype=np.int32)
+        cs_label_id = inst_raw // 1000
+        cs_inst_num = inst_raw % 1000
+
+        # Build KITTI-style instance map: unique per-pixel instance ID for things
+        instance_map = np.zeros((h, w), dtype=np.int64)
+        next_id = 1
+        for uid in np.unique(inst_raw):
+            lid = uid // 1000
+            inum = uid % 1000
+            if inum == 0:
+                continue
+            # Map Cityscapes labelId to trainId and check if thing
+            tid_arr = labelids_to_trainids(np.array([lid]))
+            tid = int(tid_arr[0])
+            if tid not in _CITYSCAPES_THING_TRAINIDS:
+                continue
+            mask = inst_raw == uid
+            instance_map[mask] = next_id
+            next_id += 1
+
+        inst_tensor = torch.from_numpy(instance_map).long()
+        return stacked, sem, inst_tensor
