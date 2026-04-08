@@ -183,6 +183,6 @@ class IoUTracker:
             self._age_unmatched_tracks(cls, unmatched_tracks)
 
         if self.next_track_id >= self.label_divisor:
-            raise ValueError("Too many tracks for current label_divisor.")
+            self.next_track_id = 1
 
         return pred_sem * self.label_divisor + out_inst

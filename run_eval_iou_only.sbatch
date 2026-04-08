@@ -26,7 +26,7 @@ echo "====== STQ evaluation — IoU tracker ======"
   --split val \
   --ckpt "${KITTI_CKPT}" \
   --postprocess legacy \
-  --label_divisor 10000 \
+  --label_divisor 100000 \
   --nms_kernel 13 \
   --track_sigma 10 \
   --log_every 50 \

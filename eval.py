@@ -1,6 +1,6 @@
 """Generate evaluation visualizations: a result PNG and an MP4 video.
 
-Produces a 2×2 grid per frame:
+Produces a 2x2 grid per frame (pure OpenCV, no matplotlib):
   - Input Frame | Semantic Overlay (Cityscapes palette)
   - Instance Center Heatmap | Motion Vectors (HSV)
 
@@ -13,12 +13,8 @@ import os
 import sys
 
 import cv2
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from matplotlib.colors import ListedColormap
 from torch.amp import autocast
 
 from dataset import KittiStepDataset
@@ -27,52 +23,57 @@ from official_postprocess import decode_panoptic_official
 
 THING_CLASSES_KITTI_STEP = [11, 13]
 
-CITYSCAPES_COLORS = [
+CITYSCAPES_PALETTE = np.array([
     [128, 64, 128], [244, 35, 232], [70, 70, 70], [102, 102, 156],
     [190, 153, 153], [153, 153, 153], [250, 170, 30], [220, 220, 0],
     [107, 142, 35], [152, 251, 152], [70, 130, 180], [220, 20, 60],
     [255, 0, 0], [0, 0, 142], [0, 0, 70], [0, 60, 100],
     [0, 80, 100], [0, 0, 230], [119, 11, 32], [0, 0, 0],
-]
-_CMAP = ListedColormap(np.array(CITYSCAPES_COLORS, dtype=np.float32) / 255.0)
+], dtype=np.uint8)
+
+MAGMA_LUT = cv2.applyColorMap(np.arange(256, dtype=np.uint8), cv2.COLORMAP_MAGMA)
 
 
-def _visualize(image_chw, predictions):
-    sem_pred = np.argmax(predictions["semantic_logits"][0].cpu().numpy(), axis=0)
-    sem_pred[sem_pred == 255] = 19
+def _render_frame_cv2(img_rgb_uint8, predictions, h, w):
+    """Render 2x2 grid as a single BGR image using OpenCV."""
+    sem_pred = torch.argmax(predictions["semantic_logits"][0], dim=0).cpu().numpy()
+    sem_pred = np.clip(sem_pred, 0, 19).astype(np.uint8)
+
+    sem_color = CITYSCAPES_PALETTE[sem_pred]
+    overlay = cv2.addWeighted(img_rgb_uint8, 0.5, sem_color, 0.5, 0)
 
     center_heat = torch.sigmoid(predictions["center_heatmap"][0, 0]).cpu().numpy()
+    heat_u8 = np.clip(center_heat * 255, 0, 255).astype(np.uint8)
+    heat_color = MAGMA_LUT[heat_u8].reshape(h, w, 3)
 
     motion_yx = predictions["motion_offsets"][0].cpu().numpy()
     mag, ang = cv2.cartToPolar(motion_yx[1], motion_yx[0])
-    hsv = np.zeros((*motion_yx.shape[1:], 3), dtype=np.uint8)
+    hsv = np.zeros((h, w, 3), dtype=np.uint8)
     hsv[..., 0] = (ang * 180 / np.pi / 2).astype(np.uint8)
     hsv[..., 1] = 255
     hsv[..., 2] = cv2.normalize(mag, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    motion_rgb = cv2.cvtColor(hsv, cv2.COLOR_HSV2RGB)
+    motion_bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
 
-    img_np = image_chw.permute(1, 2, 0).cpu().numpy()
+    img_bgr = cv2.cvtColor(img_rgb_uint8, cv2.COLOR_RGB2BGR)
+    overlay_bgr = cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR)
 
-    fig, axes = plt.subplots(2, 2, figsize=(20, 10))
-    axes[0, 0].imshow(img_np)
-    axes[0, 0].set_title("Input Frame")
-    axes[0, 1].imshow(img_np)
-    axes[0, 1].imshow(sem_pred, cmap=_CMAP, alpha=0.5, vmin=0, vmax=19)
-    axes[0, 1].set_title("Semantic Overlay")
-    axes[1, 0].imshow(center_heat, cmap="magma")
-    axes[1, 0].set_title("Instance Center Heatmap")
-    axes[1, 1].imshow(motion_rgb)
-    axes[1, 1].set_title("Motion Vectors (HSV)")
-    for ax in axes.flat:
-        ax.axis("off")
-    plt.tight_layout()
-    return fig
+    label_h = 30
+    def _add_label(img, text):
+        out = np.zeros((img.shape[0] + label_h, img.shape[1], 3), dtype=np.uint8)
+        out[:label_h] = 40
+        cv2.putText(out, text, (10, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+        out[label_h:] = img
+        return out
 
+    tl = _add_label(img_bgr, "Input Frame")
+    tr = _add_label(overlay_bgr, "Semantic Overlay")
+    bl = _add_label(heat_color, "Instance Center Heatmap")
+    br = _add_label(motion_bgr, "Motion Vectors (HSV)")
 
-def _fig_to_bgr(fig):
-    fig.canvas.draw()
-    buf = np.asarray(fig.canvas.buffer_rgba())
-    return cv2.cvtColor(buf, cv2.COLOR_RGBA2BGR)
+    top = np.concatenate([tl, tr], axis=1)
+    bot = np.concatenate([bl, br], axis=1)
+    grid = np.concatenate([top, bot], axis=0)
+    return grid
 
 
 def main():
@@ -149,22 +150,21 @@ def main():
             prev_heatmap = torch.from_numpy(rendered_hw).unsqueeze(0).unsqueeze(0).to(device)
 
             curr_rgb = torch.clamp(images[0, :3] * std + mean, 0, 1)
-            fig = _visualize(curr_rgb, predictions)
+            img_rgb_uint8 = (curr_rgb.permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
 
-            # Save a single representative frame as PNG (frame at ~30% of sequence)
+            grid_bgr = _render_frame_cv2(img_rgb_uint8, predictions, args.crop_h, args.crop_w)
+
             if not saved_result_png and (i - start_idx) >= (end_idx - start_idx) * 0.3:
-                fig.savefig(result_path, dpi=150, bbox_inches="tight")
+                cv2.imwrite(result_path, grid_bgr)
                 print(f"Saved {result_path}")
                 saved_result_png = True
 
-            frame_bgr = _fig_to_bgr(fig)
             if video_writer is None:
-                h, w, _ = frame_bgr.shape
+                gh, gw = grid_bgr.shape[:2]
                 video_writer = cv2.VideoWriter(
-                    video_path, cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (w, h),
+                    video_path, cv2.VideoWriter_fourcc(*"mp4v"), args.fps, (gw, gh),
                 )
-            video_writer.write(frame_bgr)
-            plt.close(fig)
+            video_writer.write(grid_bgr)
 
             if (i - start_idx + 1) % 50 == 0 or i == end_idx - 1:
                 print(f"  Processed {i - start_idx + 1}/{end_idx - start_idx} frames")
