@@ -114,7 +114,6 @@ Completely rewritten from the original (which produced a simple 1×2 grid with e
 
 | Version | STQ | AQ | IoU |
 |---------|------|------|------|
-| Original baseline (epoch 60) | 0.325 | 0.230 | 0.459 |
 | **Ours (epoch 180)** | **0.477** | **0.429** | **0.531** |
 | **Improvement** | **+47%** | **+87%** | **+16%** |
 
